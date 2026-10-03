@@ -345,7 +345,33 @@ pub fn classify<R: Rng + ?Sized>(
     );
     (tier, request_type)
 }
+/// Default classifier backed by the existing deterministic regex classifier.
+pub struct RegexRequestClassifier;
 
+#[async_trait::async_trait]
+impl RequestClassifier for RegexRequestClassifier {
+    async fn classify(
+        &self,
+        input: ClassifyInput<'_>,
+    ) -> Result<Classification, String> {
+        let request_type = classify_request_type(input.query);
+
+        let complexity = match request_type {
+            RequestType::CodeGeneration
+            | RequestType::TechnicalDesign
+            | RequestType::AnalyticalReasoning => 4,
+            RequestType::CodeUnderstanding | RequestType::Writing => 3,
+            RequestType::FactualLookup => 2,
+            RequestType::General => 1,
+        };
+
+        Ok(Classification {
+            request_type,
+            complexity,
+            confidence: 0.5,
+        })
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
