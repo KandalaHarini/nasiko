@@ -26,7 +26,7 @@
 //! feedback accumulates the posterior tightens and selection converges. Thompson's
 //! stochasticity is the exploration that makes that learning possible, so production feeds
 //! it an entropy RNG; tests inject a seeded one.
-
+use std::time::Duration;
 use std::collections::HashMap;
 
 use rand::Rng;
