@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use nasiko_llm_router::routing::{
     build_classifier,
@@ -14,7 +14,7 @@ use nasiko_llm_router::routing::{
     RequestType,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 struct EvalCase {
@@ -29,15 +29,30 @@ struct EvalFile {
     cases: Vec<EvalCase>,
 }
 
+#[derive(Debug, Serialize)]
+struct EvalOutput {
+    backend: String,
+    query: String,
+    expected_request_type: String,
+    predicted_request_type: String,
+    expected_complexity: Option<u8>,
+    predicted_complexity: u8,
+    confidence: f32,
+    fallback: bool,
+    latency_us: u128,
+}
+
 #[derive(Debug, Default)]
 struct Metrics {
     total: usize,
     correct: usize,
     complexity_total: usize,
     complexity_correct: usize,
-    brier_sum: f64,
+    confidences: Vec<f64>,
+    correctness: Vec<bool>,
     latencies_us: Vec<u128>,
     fallbacks: usize,
+    outputs: Vec<EvalOutput>,
 }
 
 impl Metrics {
@@ -54,8 +69,7 @@ impl Metrics {
             return 0.0;
         }
 
-        self.complexity_correct as f64
-            / self.complexity_total as f64
+        self.complexity_correct as f64 / self.complexity_total as f64
     }
 
     fn ece(&self) -> f64 {
@@ -63,20 +77,38 @@ impl Metrics {
             return 0.0;
         }
 
-        /*
-         * Ten equal-width confidence bins.
-         *
-         * For this evaluation we use the standard
-         * confidence-vs-correctness calibration gap.
-         */
         let mut bins: Vec<Vec<(f64, bool)>> =
             (0..10).map(|_| Vec::new()).collect();
 
-        for item in &self.latency_records {
-            let _ = item;
+        for (confidence, correct) in
+            self.confidences.iter().zip(self.correctness.iter())
+        {
+            let index = ((*confidence * 10.0).floor() as usize).min(9);
+            bins[index].push((*confidence, *correct));
         }
 
-        self.brier_sum / self.total as f64
+        let mut ece = 0.0;
+
+        for bin in bins {
+            if bin.is_empty() {
+                continue;
+            }
+
+            let count = bin.len() as f64;
+
+            let avg_confidence =
+                bin.iter().map(|(confidence, _)| confidence).sum::<f64>()
+                    / count;
+
+            let accuracy =
+                bin.iter().filter(|(_, correct)| *correct).count() as f64
+                    / count;
+
+            ece += (count / self.total as f64)
+                * (avg_confidence - accuracy).abs();
+        }
+
+        ece
     }
 
     fn p50_us(&self) -> u128 {
@@ -85,11 +117,6 @@ impl Metrics {
 
     fn p95_us(&self) -> u128 {
         percentile(&self.latencies_us, 0.95)
-    }
-
-    // Kept separate so the evaluator can accumulate calibration data.
-    fn latency_records(&self) -> Vec<(u128, f64, bool)> {
-        Vec::new()
     }
 }
 
@@ -102,16 +129,14 @@ fn percentile(values: &[u128], percentile: f64) -> u128 {
     sorted.sort_unstable();
 
     let index =
-        ((sorted.len() - 1) as f64 * percentile)
-            .round() as usize;
+        ((sorted.len() - 1) as f64 * percentile).round() as usize;
 
     sorted[index.min(sorted.len() - 1)]
 }
 
 fn parse_eval_file(path: &str) -> Result<Vec<EvalCase>, String> {
-    let content =
-        fs::read_to_string(path)
-            .map_err(|e| format!("failed to read {path}: {e}"))?;
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {path}: {e}"))?;
 
     if let Ok(file) = serde_json::from_str::<EvalFile>(&content) {
         if !file.cases.is_empty() {
@@ -127,28 +152,7 @@ fn request_type_from_case(value: &str) -> Option<RequestType> {
     RequestType::from_wire(value)
 }
 
-fn classify_once(
-    classifier: &dyn RequestClassifier,
-    query: &str,
-) -> Result<(Classification, bool), String> {
-    let stats = ClassifierStats::new();
-
-    let future = classify_with_fallback(
-        classifier,
-        &ClassifyInput {
-            query,
-            context: None,
-        },
-        Some(&stats),
-    );
-
-    let result = tokio::runtime::Handle::current()
-        .block_on(future);
-
-    Ok((result.0, result.1))
-}
-
-fn evaluate_backend(
+async fn evaluate_backend(
     name: &str,
     classifier: &dyn RequestClassifier,
     cases: &[EvalCase],
@@ -173,46 +177,38 @@ fn evaluate_backend(
         let start = Instant::now();
 
         let (classification, fell_back) =
-            tokio::runtime::Handle::current()
-                .block_on(classify_with_fallback(
-                    classifier,
-                    &ClassifyInput {
-                        query: &case.query,
-                        context: None,
-                    },
-                    Some(&stats),
-                ));
+            classify_with_fallback(
+                classifier,
+                &ClassifyInput {
+                    query: &case.query,
+                    context: None,
+                },
+                Some(&stats),
+            )
+            .await;
 
-        let elapsed =
-            start.elapsed().as_micros();
+        let elapsed = start.elapsed().as_micros();
+
+        let correct =
+            classification.request_type == expected;
 
         metrics.total += 1;
         metrics.latencies_us.push(elapsed);
 
-        if classification.request_type == expected {
+        if correct {
             metrics.correct += 1;
         }
 
         let confidence =
             classification.confidence.clamp(0.0, 1.0) as f64;
 
-        let correct =
-            classification.request_type == expected;
+        metrics.confidences.push(confidence);
+        metrics.correctness.push(correct);
 
-        let target =
-            if correct { 1.0 } else { 0.0 };
-
-        metrics.brier_sum +=
-            (confidence - target).powi(2);
-
-        if let Some(expected_complexity) =
-            case.complexity
-        {
+        if let Some(expected_complexity) = case.complexity {
             metrics.complexity_total += 1;
 
-            if classification.complexity
-                == expected_complexity
-            {
+            if classification.complexity == expected_complexity {
                 metrics.complexity_correct += 1;
             }
         }
@@ -220,6 +216,19 @@ fn evaluate_backend(
         if fell_back {
             metrics.fallbacks += 1;
         }
+
+        metrics.outputs.push(EvalOutput {
+            backend: name.to_string(),
+            query: case.query.clone(),
+            expected_request_type: expected.as_str().to_string(),
+            predicted_request_type:
+                classification.request_type.as_str().to_string(),
+            expected_complexity: case.complexity,
+            predicted_complexity: classification.complexity,
+            confidence: classification.confidence,
+            fallback: fell_back,
+            latency_us: elapsed,
+        });
     }
 
     println!();
@@ -243,7 +252,7 @@ fn evaluate_backend(
     );
 
     println!(
-        "Brier calibration error:  {:.4}",
+        "ECE:                      {:.4}",
         metrics.ece()
     );
 
@@ -265,17 +274,39 @@ fn evaluate_backend(
     metrics
 }
 
+fn write_jsonl(
+    path: &str,
+    outputs: &[EvalOutput],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut content = String::new();
+
+    for output in outputs {
+        content.push_str(
+            &serde_json::to_string(output)?
+        );
+        content.push('\n');
+    }
+
+    fs::write(path, content)?;
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let eval_path =
-        env::var("EVAL_SET")
-            .unwrap_or_else(|_| {
-                "examples/data/classifier-eval-dev-json"
-                    .to_string()
-            });
+    let eval_path = env::var("EVAL_SET")
+        .unwrap_or_else(|_| {
+            "examples/data/classifier-eval-dev-json"
+                .to_string()
+        });
 
-    let cases =
-        parse_eval_file(&eval_path)?;
+    let out_path = env::var("OUT")
+        .unwrap_or_else(|_| {
+            "/tmp/classifier-out.jsonl"
+                .to_string()
+        });
+
+    let cases = parse_eval_file(&eval_path)?;
 
     if cases.is_empty() {
         return Err(
@@ -293,56 +324,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Regex baseline
     // ------------------------------------------------------------
 
-    let regex =
-        RegexRequestClassifier;
+    let regex = RegexRequestClassifier;
 
     let regex_metrics =
         evaluate_backend(
             "REGEX BASELINE",
             &regex,
             &cases,
-        );
+        )
+        .await;
 
     // ------------------------------------------------------------
     // 2. Configured backend
     // ------------------------------------------------------------
 
-    let settings =
-        ClassifierSettings {
-            backend: env::var(
-                "CLASSIFIER_BACKEND"
-            )
-            .unwrap_or_else(|_| "regex".to_string()),
+    let settings = ClassifierSettings {
+        backend: env::var(
+            "CLASSIFIER_BACKEND"
+        )
+        .unwrap_or_else(|_| "regex".to_string()),
 
-            model: env::var(
-                "CLASSIFIER_MODEL"
-            )
-            .unwrap_or_default(),
+        model: env::var(
+            "CLASSIFIER_MODEL"
+        )
+        .unwrap_or_default(),
 
-            endpoint: env::var(
-                "CLASSIFIER_ENDPOINT"
-            )
-            .unwrap_or_default(),
+        endpoint: env::var(
+            "CLASSIFIER_ENDPOINT"
+        )
+        .unwrap_or_default(),
 
-            api_key: env::var(
-                "CLASSIFIER_API_KEY"
-            )
-            .ok(),
+        api_key: env::var(
+            "CLASSIFIER_API_KEY"
+        )
+        .ok(),
 
-            timeout_ms: env::var(
-                "CLASSIFIER_TIMEOUT_MS"
-            )
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5000),
+        timeout_ms: env::var(
+            "CLASSIFIER_TIMEOUT_MS"
+        )
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5000),
 
-            min_confidence: env::var(
-                "CLASSIFIER_MIN_CONFIDENCE"
-            )
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.5),
-        };
+        min_confidence: env::var(
+            "CLASSIFIER_MIN_CONFIDENCE"
+        )
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.5),
+    };
 
     let configured =
         build_classifier(&settings);
@@ -352,7 +382,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             configured.name(),
             configured.as_ref(),
             &cases,
-        );
+        )
+        .await;
 
     // ------------------------------------------------------------
     // Summary
@@ -372,6 +403,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{} accuracy:       {:.2}%",
         configured.name(),
         configured_metrics.accuracy() * 100.0
+    );
+
+    println!(
+        "Regex ECE:            {:.4}",
+        regex_metrics.ece()
+    );
+
+    println!(
+        "{} ECE:            {:.4}",
+        configured.name(),
+        configured_metrics.ece()
     );
 
     println!(
@@ -405,6 +447,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "{} fallbacks:      {}",
         configured.name(),
         configured_metrics.fallbacks
+    );
+
+    let mut all_outputs = regex_metrics.outputs;
+    all_outputs.extend(configured_metrics.outputs);
+
+    write_jsonl(&out_path, &all_outputs)?;
+
+    println!();
+    println!(
+        "Evaluation output: {}",
+        out_path
     );
 
     println!();
