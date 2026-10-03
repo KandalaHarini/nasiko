@@ -58,7 +58,12 @@ pub struct GatewayConfig {
     /// Interval between provider model-catalog syncs (`GET /models` →
     /// `provider_models`). Provider model lists move slowly — default 86400 (24 h).
     pub model_catalog_sync_interval_secs: u64,
-
+    /// Request classifier backend. Defaults to the deterministic regex classifier.
+    pub classifier_backend: String,
+    /// Optional model path or endpoint used by the configured classifier backend.
+    pub classifier_model: String,
+    /// Classifier inference timeout in milliseconds.
+    pub classifier_timeout_ms: u64,
     /// Interval between Portkey price-book syncs (`model_pricing`). Prices move
     /// slowly — default 86400 (24 h).
     pub pricing_sync_interval_secs: u64,
@@ -173,6 +178,9 @@ impl Default for GatewayConfig {
             router_decision_ttl_secs: 3600,
             attribution_window_secs: 600,
             model_catalog_sync_interval_secs: 86_400,
+            classifier_backend: "regex".into(),
+            classifier_model: String::new(),
+            classifier_timeout_ms: 5000,
             pricing_sync_interval_secs: 86_400,
             openai_api_base: "https://api.openai.com/v1".into(),
             anthropic_api_base: "https://api.anthropic.com/v1".into(),
@@ -247,6 +255,12 @@ impl GatewayConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(d.model_catalog_sync_interval_secs),
+            classifier_backend: env_or("CLASSIFIER_BACKEND", &d.classifier_backend),
+            classifier_model: env_or("CLASSIFIER_MODEL", &d.classifier_model),
+            classifier_timeout_ms: std::env::var("CLASSIFIER_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d.classifier_timeout_ms),
             pricing_sync_interval_secs: env_parse_first(
                 &[
                     "PRICING_SYNC_INTERVAL_SECS",
