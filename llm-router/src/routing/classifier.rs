@@ -59,7 +59,29 @@ pub enum RequestType {
     FactualLookup,
     General,
 }
+/// Input provided to a request classifier.
+#[derive(Debug, Clone)]
+pub struct ClassifyInput<'a> {
+    pub query: &'a str,
+    pub context: Option<&'a str>,
+}
 
+/// Model-agnostic classification result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Classification {
+    pub request_type: RequestType,
+    pub complexity: u8,
+    pub confidence: f32,
+}
+
+/// Pluggable request-classification backend.
+#[async_trait::async_trait]
+pub trait RequestClassifier: Send + Sync {
+    async fn classify(
+        &self,
+        input: ClassifyInput<'_>,
+    ) -> Result<Classification, String>;
+}
 impl RequestType {
     /// Stable string form used as the persisted cell key (`router_quality_cells.request_type`).
     pub fn as_str(self) -> &'static str {
