@@ -1,194 +1,410 @@
 //! Request-classifier evaluation harness.
 //!
-//! ```sh
+//! Usage:
+//!
+//! ```text
 //! EVAL_SET=/tmp/classifier-eval.json OUT=/tmp/classifier-out.jsonl \
-//!   cargo run --release -p nasiko-llm-router --example classifier_eval
+//! cargo run --release -p nasiko-llm-router --example classifier_eval
 //! ```
 //!
-//! * `EVAL_SET` — JSON file with an `examples` array (a bare array also works). Each case:
-//!   `{id?, query, context?, request_type?, complexity?}`. Labels are optional; with them a
-//!   summary (accuracy, complexity error, ECE, latency) is printed to stderr.
-//! * `OUT` — optional. One JSONL line per case:
-//!   `{"id","request_type","complexity","confidence","latency_us","fallback"}`.
-//!   Outputs only; scoring happens elsewhere.
-//! * Backend: `CLASSIFIER_BACKEND` (`regex` default | `http`), `CLASSIFIER_MODEL`,
-//!   `CLASSIFIER_ENDPOINT`, `CLASSIFIER_API_KEY`, `CLASSIFIER_TIMEOUT_MS` (5000),
-//!   `CLASSIFIER_MIN_CONFIDENCE` (0.5). Same variables as the router binary.
+//! EVAL_SET may contain either:
 //!
-//! Every case goes through [`classify_with_fallback`] — the function the router calls — so
-//! this exercises the production path, including regex fallback on error/timeout/low
-//! confidence. Per-call `latency_us` covers only the classify call (backend construction,
-//! i.e. one-time load, happens before the loop). A warm-up call is made first and not
-//! recorded.
+//! {
+//!   "examples": [
+//!     {
+//!       "id": "1",
+//!       "query": "Write a Python function to sort a list",
+//!       "request_type": "code_generation",
+//!       "complexity": 3
+//!     }
+//!   ]
+//! }
+//!
+//! or a bare JSON array with the same objects.
+//!
+//! OUT is optional. When provided, one JSON object is written per line.
 
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Instant;
 
-use nasiko_llm_router::routing::classifier::{
-    Classification, ClassifierSettings, ClassifierStats, ClassifyInput, RegexRequestClassifier,
-    RequestClassifier, RequestType, build_classifier, classify_with_fallback,
+use nasiko_llm_router::routing::{
+    Classification,
+    ClassifyInput,
+    RequestClassifier,
+    RequestType,
+    RegexRequestClassifier,
 };
+
 use serde_json::{Value, json};
 
 struct Case {
     id: String,
     query: String,
     context: Option<String>,
-    request_type: Option<RequestType>,
-    complexity: Option<u8>,
+    expected_type: Option<RequestType>,
+    expected_complexity: Option<u8>,
 }
 
 struct Row {
-    c: Classification,
+    classification: Classification,
     latency_us: u128,
-    fallback: bool,
 }
 
-fn env(k: &str) -> Option<String> {
-    std::env::var(k).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+fn env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
-fn settings_from_env() -> ClassifierSettings {
-    let d = ClassifierSettings::default();
-    ClassifierSettings {
-        backend: env("CLASSIFIER_BACKEND").unwrap_or(d.backend),
-        model: env("CLASSIFIER_MODEL").unwrap_or(d.model),
-        endpoint: env("CLASSIFIER_ENDPOINT").unwrap_or(d.endpoint),
-        api_key: env("CLASSIFIER_API_KEY"),
-        timeout_ms: env("CLASSIFIER_TIMEOUT_MS").and_then(|v| v.parse().ok()).unwrap_or(d.timeout_ms),
-        min_confidence: env("CLASSIFIER_MIN_CONFIDENCE")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(d.min_confidence),
+/// Convert the public wire label from the evaluation JSON into RequestType.
+fn parse_request_type(value: Option<&str>) -> Option<RequestType> {
+    match value? {
+        "code_generation" => Some(RequestType::CodeGeneration),
+        "code_understanding" => Some(RequestType::CodeUnderstanding),
+        "technical_design" => Some(RequestType::TechnicalDesign),
+        "analytical_reasoning" => Some(RequestType::AnalyticalReasoning),
+        "writing" => Some(RequestType::Writing),
+        "factual_lookup" => Some(RequestType::FactualLookup),
+        "general" => Some(RequestType::General),
+        _ => None,
     }
 }
 
+/// Load evaluation cases from EVAL_SET.
 fn load_cases(path: &str) -> Vec<Case> {
-    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read EVAL_SET {path}: {e}"));
-    let v: Value = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("EVAL_SET is not valid JSON: {e}"));
-    let items = v
+    let raw = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("cannot read EVAL_SET {path}: {error}"));
+
+    let value: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|error| panic!("EVAL_SET is not valid JSON: {error}"));
+
+    let items = value
         .get("examples")
-        .and_then(|e| e.as_array())
-        .or_else(|| v.as_array())
-        .unwrap_or_else(|| panic!("EVAL_SET needs an `examples` array"));
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+        .unwrap_or_else(|| {
+            panic!("EVAL_SET must contain an `examples` array or be a JSON array")
+        });
+
     items
         .iter()
         .enumerate()
-        .map(|(i, it)| Case {
-            id: it.get("id").and_then(|x| x.as_str()).map(str::to_string).unwrap_or_else(|| format!("case-{:03}", i + 1)),
-            query: it.get("query").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-            context: it.get("context").and_then(|x| x.as_str()).map(str::to_string),
-            request_type: it.get("request_type").and_then(|x| x.as_str()).and_then(RequestType::from_wire),
-            complexity: it.get("complexity").and_then(|x| x.as_u64()).map(|c| c as u8),
+        .map(|(index, item)| {
+            let query = item
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("case-{:03}", index + 1));
+
+            let context = item
+                .get("context")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+
+            let expected_type = item
+                .get("request_type")
+                .and_then(Value::as_str)
+                .and_then(parse_request_type);
+
+            let expected_complexity = item
+                .get("complexity")
+                .and_then(Value::as_u64)
+                .map(|value| value as u8);
+
+            Case {
+                id,
+                query,
+                context,
+                expected_type,
+                expected_complexity,
+            }
         })
         .collect()
 }
 
-async fn run(backend: &dyn RequestClassifier, cases: &[Case]) -> (Vec<Row>, ClassifierStats) {
-    let stats = ClassifierStats::default();
-    // Warm-up (connection setup etc.) — not recorded and not counted.
+/// Run one classifier backend over the complete evaluation set.
+async fn run_classifier(
+    classifier: &dyn RequestClassifier,
+    cases: &[Case],
+) -> Vec<Row> {
+    let mut rows = Vec::with_capacity(cases.len());
+
+    // Warm-up call.
     if let Some(first) = cases.first() {
-        let _ = backend
-            .classify(&ClassifyInput { query: &first.query, context: first.context.as_deref() })
+        let _ = classifier
+            .classify(ClassifyInput {
+                query: &first.query,
+                context: first.context.as_deref(),
+            })
             .await;
     }
-    let mut rows = Vec::with_capacity(cases.len());
+
     for case in cases {
-        let input = ClassifyInput { query: &case.query, context: case.context.as_deref() };
+        let input = ClassifyInput {
+            query: &case.query,
+            context: case.context.as_deref(),
+        };
+
         let start = Instant::now();
-        let (c, fallback) = classify_with_fallback(backend, &input, Some(&stats)).await;
-        rows.push(Row { c, latency_us: start.elapsed().as_micros(), fallback });
+
+        let classification = classifier
+            .classify(input)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "classifier failed for {}: {}",
+                    case.id, error
+                )
+            });
+
+        let latency_us = start.elapsed().as_micros();
+
+        rows.push(Row {
+            classification,
+            latency_us,
+        });
     }
-    (rows, stats)
+
+    rows
 }
 
-fn percentile(sorted: &[u128], p: f64) -> u128 {
-    if sorted.is_empty() {
+/// Calculate percentile latency.
+fn percentile(values: &[u128], percentile: f64) -> u128 {
+    if values.is_empty() {
         return 0;
     }
-    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
-    sorted[idx]
+
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+
+    let position =
+        ((sorted.len() - 1) as f64 * percentile).round() as usize;
+
+    sorted[position]
 }
 
-/// Expected calibration error over 10 equal-width confidence bins:
-/// `Σ (bin_size / N) · |accuracy(bin) − mean_confidence(bin)|`.
+/// Expected Calibration Error.
+///
+/// Ten equal-width confidence bins are used.
 fn ece(pairs: &[(f32, bool)]) -> f64 {
-    let n = pairs.len() as f64;
-    if n == 0.0 {
+    if pairs.is_empty() {
         return 0.0;
     }
-    let mut bins = [(0usize, 0.0f64, 0usize); 10]; // (count, conf_sum, correct)
-    for &(conf, ok) in pairs {
-        let b = ((conf as f64 * 10.0) as usize).min(9);
-        bins[b].0 += 1;
-        bins[b].1 += conf as f64;
-        bins[b].2 += ok as usize;
+
+    let total = pairs.len() as f64;
+
+    let mut bins = [(0usize, 0.0f64, 0usize); 10];
+
+    for &(confidence, correct) in pairs {
+        let confidence = confidence.clamp(0.0, 1.0) as f64;
+
+        let bin = ((confidence * 10.0) as usize).min(9);
+
+        bins[bin].0 += 1;
+        bins[bin].1 += confidence;
+        bins[bin].2 += usize::from(correct);
     }
+
     bins.iter()
-        .filter(|b| b.0 > 0)
-        .map(|&(cnt, csum, ok)| {
-            let c = cnt as f64;
-            (c / n) * ((ok as f64 / c) - (csum / c)).abs()
+        .filter(|(count, _, _)| *count > 0)
+        .map(|(count, confidence_sum, correct)| {
+            let count_f = *count as f64;
+
+            let accuracy = *correct as f64 / count_f;
+            let confidence = *confidence_sum / count_f;
+
+            (count_f / total) * (accuracy - confidence).abs()
         })
         .sum()
 }
 
-fn summarize(name: &str, cases: &[Case], rows: &[Row], stats: &ClassifierStats) {
-    let labelled: Vec<_> = cases.iter().zip(rows).filter(|(c, _)| c.request_type.is_some()).collect();
-    let mut lat: Vec<u128> = rows.iter().map(|r| r.latency_us).collect();
-    lat.sort_unstable();
-    eprintln!("Backend: {name}");
-    if labelled.is_empty() {
-        eprintln!("  (no labels in EVAL_SET: accuracy/ECE not computed)");
-    } else {
-        let correct: Vec<bool> = labelled.iter().map(|(c, r)| c.request_type == Some(r.c.request_type)).collect();
-        let acc = correct.iter().filter(|x| **x).count() as f64 / correct.len() as f64;
-        let cx: Vec<(u8, u8)> = labelled
-            .iter()
-            .filter_map(|(c, r)| c.complexity.map(|g| (g, r.c.complexity)))
-            .collect();
-        let pairs: Vec<(f32, bool)> = labelled.iter().zip(&correct).map(|((_, r), ok)| (r.c.confidence, *ok)).collect();
-        eprintln!("  Request-type accuracy: {:.1}% ({}/{})", acc * 100.0, correct.iter().filter(|x| **x).count(), correct.len());
-        if !cx.is_empty() {
-            let mae = cx.iter().map(|(g, p)| (*g as f64 - *p as f64).abs()).sum::<f64>() / cx.len() as f64;
-            let exact = cx.iter().filter(|(g, p)| g == p).count() as f64 / cx.len() as f64;
-            eprintln!("  Complexity: MAE {mae:.2}, exact {:.1}%", exact * 100.0);
+/// Print evaluation metrics.
+fn summarize(
+    name: &str,
+    cases: &[Case],
+    rows: &[Row],
+) {
+    println!();
+    println!("========================================");
+    println!("Backend: {name}");
+    println!("========================================");
+
+    let latencies: Vec<u128> =
+        rows.iter().map(|row| row.latency_us).collect();
+
+    println!(
+        "Latency p50/p95: {}us / {}us",
+        percentile(&latencies, 0.50),
+        percentile(&latencies, 0.95)
+    );
+
+    let mut type_correct = Vec::new();
+
+    let mut complexity_pairs = Vec::new();
+
+    let mut calibration_pairs = Vec::new();
+
+    for (case, row) in cases.iter().zip(rows.iter()) {
+        if let Some(expected) = case.expected_type {
+            let correct =
+                expected == row.classification.request_type;
+
+            type_correct.push(correct);
+
+            calibration_pairs.push((
+                row.classification.confidence,
+                correct,
+            ));
         }
-        eprintln!("  ECE (10 bins): {:.3}", ece(&pairs));
+
+        if let Some(expected_complexity) =
+            case.expected_complexity
+        {
+            complexity_pairs.push((
+                expected_complexity,
+                row.classification.complexity,
+            ));
+        }
     }
-    eprintln!("  Latency p50/p95: {}us / {}us", percentile(&lat, 0.50), percentile(&lat, 0.95));
-    eprintln!("  Fallbacks: {}/{}", stats.fallbacks(), stats.calls());
+
+    if !type_correct.is_empty() {
+        let correct_count =
+            type_correct.iter().filter(|value| **value).count();
+
+        let accuracy =
+            correct_count as f64 / type_correct.len() as f64;
+
+        println!(
+            "Request-type accuracy: {:.1}% ({}/{})",
+            accuracy * 100.0,
+            correct_count,
+            type_correct.len()
+        );
+
+        println!(
+            "ECE (10 bins): {:.3}",
+            ece(&calibration_pairs)
+        );
+    } else {
+        println!(
+            "Request-type accuracy: not available (no labels)"
+        );
+        println!("ECE: not available (no labels)");
+    }
+
+    if !complexity_pairs.is_empty() {
+        let mae = complexity_pairs
+            .iter()
+            .map(|(expected, predicted)| {
+                (*expected as f64 - *predicted as f64).abs()
+            })
+            .sum::<f64>()
+            / complexity_pairs.len() as f64;
+
+        let exact = complexity_pairs
+            .iter()
+            .filter(|(expected, predicted)| expected == predicted)
+            .count() as f64
+            / complexity_pairs.len() as f64;
+
+        println!("Complexity MAE: {:.2}", mae);
+        println!(
+            "Complexity exact accuracy: {:.1}%",
+            exact * 100.0
+        );
+    } else {
+        println!(
+            "Complexity metrics: not available (no labels)"
+        );
+    }
+}
+
+/// Write evaluation results as JSONL.
+fn write_output(
+    path: &str,
+    cases: &[Case],
+    rows: &[Row],
+) {
+    let file = std::fs::File::create(path)
+        .unwrap_or_else(|error| {
+            panic!("cannot create OUT {path}: {error}")
+        });
+
+    let mut writer = std::io::BufWriter::new(file);
+
+    for (case, row) in cases.iter().zip(rows.iter()) {
+        let output = json!({
+            "id": case.id,
+            "request_type":
+                row.classification.request_type.as_str(),
+            "complexity":
+                row.classification.complexity,
+            "confidence":
+                row.classification.confidence,
+            "latency_us":
+                row.latency_us as u64,
+        });
+
+        writeln!(writer, "{output}")
+            .expect("failed to write OUT");
+
+    }
+
+    writer.flush().expect("failed to flush OUT");
 }
 
 #[tokio::main]
 async fn main() {
-    let path = env("EVAL_SET").expect("set EVAL_SET to the evaluation JSON file");
-    let cases = load_cases(&path);
-    let settings = settings_from_env();
-    let backend = build_classifier(&settings);
+    let eval_path = env("EVAL_SET")
+        .expect("set EVAL_SET to the evaluation JSON file");
 
-    let (rows, stats) = run(backend.as_ref(), &cases).await;
+    let cases = load_cases(&eval_path);
 
-    if let Some(out) = env("OUT") {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&out).unwrap_or_else(|e| panic!("cannot create OUT {out}: {e}")));
-        for (case, row) in cases.iter().zip(&rows) {
-            let line = json!({
-                "id": case.id,
-                "request_type": row.c.request_type.as_str(),
-                "complexity": row.c.complexity,
-                "confidence": row.c.confidence,
-                "latency_us": row.latency_us as u64,
-                "fallback": row.fallback,
-            });
-            writeln!(f, "{line}").expect("write OUT");
-        }
-        f.flush().expect("flush OUT");
+    if cases.is_empty() {
+        panic!("EVAL_SET contains no evaluation cases");
     }
 
-    // Human-readable comparison on stderr (OUT carries only the configured backend).
-    summarize(backend.name(), &cases, &rows, &stats);
-    if backend.name() != "regex" {
-        let regex = RegexRequestClassifier;
-        let (r_rows, r_stats) = run(&regex, &cases).await;
-        summarize("regex (baseline)", &cases, &r_rows, &r_stats);
+    println!(
+        "Loaded {} evaluation cases",
+        cases.len()
+    );
+
+    // Current default backend.
+    //
+    // This is intentionally the existing deterministic regex
+    // implementation. Additional model-backed backends will
+    // implement the same RequestClassifier trait.
+    let regex_classifier =
+        Arc::new(RegexRequestClassifier);
+
+    let rows = run_classifier(
+        regex_classifier.as_ref(),
+        &cases,
+    )
+    .await;
+
+    summarize(
+        "regex",
+        &cases,
+        &rows,
+    );
+
+    if let Some(output_path) = env("OUT") {
+        write_output(
+            &output_path,
+            &cases,
+            &rows,
+        );
+
+        println!();
+        println!("Results written to: {output_path}");
     }
 }
