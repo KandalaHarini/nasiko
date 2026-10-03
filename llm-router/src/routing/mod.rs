@@ -252,20 +252,6 @@ pub async fn route_model(
             // (`ThreadRng`) is `!Send`, so it is scoped to drop before the next `.await` — the
             // handler future must stay `Send`.
             let learned = cell_store.load(inputs.provider).await;
-            let classification = inputs
-                .classifier
-                .classify(classifier::ClassifyInput {
-                    query,
-                    context: None,
-                })
-                .await
-                .unwrap_or_else(|_| classifier::Classification {
-                    request_type: classifier::classify_request_type(query),
-                    complexity: 1,
-                    confidence: 0.5,
-    });
-
-let request_type = classification.request_type;
         let classification = inputs
             .classifier
             .classify(classifier::ClassifyInput {
