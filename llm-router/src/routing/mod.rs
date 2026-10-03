@@ -266,10 +266,22 @@ pub async fn route_model(
     });
 
 let request_type = classification.request_type;
-
-let (tier, _) = {
-    let mut rng = rand::rng();
-    classifier::classify(query, inputs.provider, &learned, &mut rng)
+        let classification = inputs
+            .classifier
+            .classify(classifier::ClassifyInput {
+                query,
+                context: None,
+            })
+            .await
+            .unwrap_or_else(|_| classifier::Classification {
+                request_type: classifier::classify_request_type(query),
+                complexity: 1,
+                confidence: 0.5,
+            });
+        let request_type = classification.request_type;
+        let (tier, _) = {
+            let mut rng = rand::rng();
+            classifier::classify(query, inputs.provider, &learned, &mut rng)
 };
             // Per-config tier override takes priority over the global registry.
             let config_override = match tier {
