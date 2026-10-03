@@ -549,6 +549,7 @@ mod tests {
             tier3_model: None,
             signals,
             query: Some("hello"),
+            classifier: std::sync::Arc::new(classifier::RegexRequestClassifier),
         }
     }
 
