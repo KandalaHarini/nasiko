@@ -83,6 +83,8 @@ pub struct RouteInputs<'a> {
     pub signals: &'a BoundarySignals,
     /// The query to classify (latest user message text). `None` disables classification.
     pub query: Option<&'a str>,
+    /// Pluggable request classifier backend.
+pub classifier: std::sync::Arc<dyn classifier::RequestClassifier>,
 }
 
 /// The outcome of routing: the model to call and how it was chosen.
