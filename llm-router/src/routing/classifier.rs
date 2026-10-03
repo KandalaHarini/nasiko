@@ -266,6 +266,16 @@ fn beta_sample<R: Rng + ?Sized>(alpha: f64, beta: f64, rng: &mut R) -> f64 {
 /// posterior (cold-start prior as pseudo-observations + learned [`Cell`] as real ones),
 /// blend with a normalized cost term, and take the argmax (ties → earlier/stronger tier).
 /// Port of the reference `pick_model_thompson`, with the three tiers as the candidate arms.
+pub fn pick_tier_for_request<R: Rng + ?Sized>(
+    cells: &CellMap,
+    request_type: RequestType,
+    w_quality: f64,
+    w_cost: f64,
+    rng: &mut R,
+) -> Tier {
+    pick_model_thompson(cells, request_type, w_quality, w_cost, rng)
+}
+
 pub fn pick_model_thompson<R: Rng + ?Sized>(
     cells: &CellMap,
     request_type: RequestType,
